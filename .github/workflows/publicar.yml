@@ -17,6 +17,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      ES_USERNAME: ${{ secrets.ES_USERNAME }} # usado para decidir se assina o .exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,8 +27,6 @@ jobs:
       # o MultiHunt.exe é assinado antes de publicar. Sem eles, a versão sai sem assinatura.
       - name: Assinar o .exe (SSL.com eSigner)
         if: env.ES_USERNAME != ''
-        env:
-          ES_USERNAME: ${{ secrets.ES_USERNAME }}
         uses: sslcom/esigner-codesign@develop
         with:
           command: sign
