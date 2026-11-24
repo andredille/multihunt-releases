@@ -1,5 +1,12 @@
-# Publica uma versão: tudo que for enviado ao ramo "upload" vira uma Release
-# (MultiHunt.exe + pacote de atualização + SHA256SUMS), e o ramo é apagado em seguida.
+# Publica uma versão: o que for enviado ao ramo "upload" vira uma Release e o site é avisado.
+# O ramo "upload" precisa ter:
+#   VERSION                       ex.: 1.2.0 (versão do pacote)
+#   SHELL_VERSION                 versão do programa base (package.json) do MultiHunt.exe enviado
+#   MIN_SHELL                     programa base mínimo para o pacote (opcional, padrão 1.1.0)
+#   NOTES.md                      novidades
+#   files/MultiHunt.exe e files/MultiHunt-<VERSION>.bundle.json
+#   .github/workflows/publicar.yml (cópia deste arquivo)
+# Segredo do repositório: RELEASE_HOOK_SECRET (o mesmo cadastrado no Lovable Cloud).
 name: Publicar versão
 on:
   push:
@@ -18,13 +25,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VER=$(cat VERSION | tr -d '[:space:]')
+          VER=$(tr -d '[:space:]' < VERSION)
           [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION inválida: $VER"; exit 1; }
+          test -f "files/MultiHunt-$VER.bundle.json" || { echo "falta files/MultiHunt-$VER.bundle.json"; exit 1; }
           cd files
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release create "v$VER" * --repo "$GITHUB_REPOSITORY" --target main \
             --title "MultiHunt $VER" --notes-file ../NOTES.md --latest
+      - name: Avisar o site (atualização automática dos apps)
+        env:
+          HOOK_SECRET: ${{ secrets.RELEASE_HOOK_SECRET }}
+          SITE: https://multihunt.lovable.app
+        run: |
+          set -euo pipefail
+          if [ -z "${HOOK_SECRET}" ]; then echo "RELEASE_HOOK_SECRET não configurado: registre a versão manualmente."; exit 0; fi
+          VER=$(tr -d '[:space:]' < VERSION)
+          SHELL_VER=$(tr -d '[:space:]' < SHELL_VERSION 2>/dev/null || echo "$VER")
+          MIN=$(tr -d '[:space:]' < MIN_SHELL 2>/dev/null || echo "1.1.0")
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VER"
+          B="files/MultiHunt-$VER.bundle.json"
+          jq -n --arg v "$VER" --arg sv "$SHELL_VER" --arg ms "$MIN" --rawfile notes NOTES.md \
+            --arg bu "$BASE/MultiHunt-$VER.bundle.json" --arg bs "$(sha256sum "$B" | cut -d' ' -f1)" --argjson bz "$(stat -c%s "$B")" \
+            --arg eu "$BASE/MultiHunt.exe" --arg es "$(sha256sum files/MultiHunt.exe | cut -d' ' -f1)" --argjson ez "$(stat -c%s files/MultiHunt.exe)" \
+            '{version:$v, shellVersion:$sv, minShell:$ms, notes:$notes, bundleUrl:$bu, bundleSha256:$bs, bundleSize:$bz, exeUrl:$eu, exeSha256:$es, exeSize:$ez}' > payload.json
+          curl -fsS -X POST "$SITE/api/webhooks/release" -H "authorization: Bearer ${HOOK_SECRET}" -H "content-type: application/json" --data @payload.json
       - name: Apagar ramo de envio
         if: always()
         env:
