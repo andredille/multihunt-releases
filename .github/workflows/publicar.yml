@@ -6,7 +6,8 @@
 #   NOTES.md                      novidades
 #   files/MultiHunt.exe e files/MultiHunt-<VERSION>.bundle.json
 #   .github/workflows/publicar.yml (cópia deste arquivo)
-# Segredo do repositório: RELEASE_HOOK_SECRET (o mesmo cadastrado no Lovable Cloud).
+# Segredos do repositório: RELEASE_HOOK_SECRET (o mesmo cadastrado no Lovable Cloud) e, para assinar o .exe,
+# ES_USERNAME, ES_PASSWORD, ES_CREDENTIAL_ID e ES_TOTP_SECRET (SSL.com eSigner).
 name: Publicar versão
 on:
   push:
@@ -20,6 +21,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: upload
+      # Assinatura digital do .exe (opcional): com os segredos do SSL.com eSigner cadastrados,
+      # o MultiHunt.exe é assinado antes de publicar. Sem eles, a versão sai sem assinatura.
+      - name: Assinar o .exe (SSL.com eSigner)
+        if: env.ES_USERNAME != ''
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+        uses: sslcom/esigner-codesign@develop
+        with:
+          command: sign
+          username: ${{ secrets.ES_USERNAME }}
+          password: ${{ secrets.ES_PASSWORD }}
+          credential_id: ${{ secrets.ES_CREDENTIAL_ID }}
+          totp_secret: ${{ secrets.ES_TOTP_SECRET }}
+          file_path: ${{ github.workspace }}/files/MultiHunt.exe
+          output_path: ${{ github.workspace }}/signed
+          environment_name: PROD
+      - name: Usar o .exe assinado
+        if: hashFiles('signed/MultiHunt.exe') != ''
+        run: mv -f signed/MultiHunt.exe files/MultiHunt.exe && echo "MultiHunt.exe assinado."
       - name: Criar release
         env:
           GH_TOKEN: ${{ github.token }}
