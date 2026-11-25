@@ -1,0 +1,121 @@
+# Publica o app Android: o que for enviado ao ramo "upload-android" é compilado aqui, assinado e vira uma Release.
+# O ramo "upload-android" precisa ter:
+#   VERSION        ex.: 1.0.0
+#   NOTES.md       novidades
+#   android/       projeto Android (Gradle)
+#   .github/workflows/android.yml (cópia deste arquivo)
+#   DRY_RUN        (opcional) só compila com a chave de teste e guarda o APK como artefato, sem publicar
+# Segredo do repositório: RELEASE_HOOK_SECRET (o mesmo do Lovable Cloud).
+# A chave de assinatura do APK é criada na primeira publicação e guardada no site (/api/ci/android-key);
+# as próximas usam a mesma chave, senão o Android não instala a atualização por cima.
+name: Publicar Android
+on:
+  push:
+    branches: [upload-android]
+permissions:
+  contents: write
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      SITE: https://multihunt.lovable.app
+      HOOK_SECRET: ${{ secrets.RELEASE_HOOK_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upload-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Modo
+        run: if [ -f DRY_RUN ]; then echo "DRY=1" >> "$GITHUB_ENV"; else echo "DRY=0" >> "$GITHUB_ENV"; fi
+      - name: Chave de assinatura
+        if: env.DRY == '0'
+        run: |
+          set -euo pipefail
+          [ -n "${HOOK_SECRET}" ] || { echo "Falta o segredo RELEASE_HOOK_SECRET."; exit 1; }
+          K="$RUNNER_TEMP/key.json"
+          code=$(curl -sS -o "$K" -w '%{http_code}' -H "authorization: Bearer ${HOOK_SECRET}" "$SITE/api/ci/android-key")
+          if [ "$code" = "404" ] && jq -e '.error == "nao_existe"' "$K" >/dev/null 2>&1; then
+            echo "Primeira publicação: criando a chave de assinatura."
+            PW=$(openssl rand -hex 24)
+            echo "::add-mask::$PW"
+            keytool -genkeypair -keystore "$RUNNER_TEMP/new.p12" -storetype PKCS12 -alias multihunt -keyalg RSA -keysize 4096 \
+              -validity 36500 -storepass "$PW" -keypass "$PW" -dname "CN=MultiHunt, O=MultiHunt, C=BR" >/dev/null 2>&1
+            jq -n --arg k "$(base64 -w0 "$RUNNER_TEMP/new.p12")" --arg p "$PW" '{keystore:$k, password:$p}' > "$RUNNER_TEMP/post.json"
+            curl -fsS -X POST -H "authorization: Bearer ${HOOK_SECRET}" -H "content-type: application/json" \
+              --data @"$RUNNER_TEMP/post.json" "$SITE/api/ci/android-key" >/dev/null
+            rm -f "$RUNNER_TEMP/post.json" "$RUNNER_TEMP/new.p12"
+            code=$(curl -sS -o "$K" -w '%{http_code}' -H "authorization: Bearer ${HOOK_SECRET}" "$SITE/api/ci/android-key")
+          fi
+          if [ "$code" != "200" ] || ! jq -e '.keystore and .password' "$K" >/dev/null 2>&1; then
+            echo "O site não entregou a chave (HTTP $code). Publique o site com a rota /api/ci/android-key (PR 'feat/android') e tente de novo."
+            exit 1
+          fi
+          PW=$(jq -r .password "$K")
+          echo "::add-mask::$PW"
+          jq -r .keystore "$K" | base64 -d > "$RUNNER_TEMP/release.p12"
+          rm -f "$K"
+          {
+            echo "MULTIHUNT_KEYSTORE_PATH=$RUNNER_TEMP/release.p12"
+            echo "MULTIHUNT_KEYSTORE_PASSWORD=$PW"
+            echo "MULTIHUNT_KEY_PASSWORD=$PW"
+            echo "MULTIHUNT_KEY_ALIAS=multihunt"
+          } >> "$GITHUB_ENV"
+      - name: Compilar APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          VER=$(tr -d '[:space:]' < ../VERSION)
+          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION inválida: $VER"; exit 1; }
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease -PmhVersion="$VER"
+          mkdir -p ../files
+          cp app/build/outputs/apk/release/app-release.apk "../files/MultiHunt-$VER.apk"
+          ls -l ../files
+      - name: APK de teste (sem publicar)
+        if: env.DRY == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-teste
+          path: files/*.apk
+          retention-days: 3
+      - name: Conferir assinatura
+        if: env.DRY == '0'
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs files/*.apk | grep -E "Signer #1 certificate (DN|SHA-256)"
+      - name: Criar release
+        if: env.DRY == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER=$(tr -d '[:space:]' < VERSION)
+          cd files && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          # --latest=false: o link "latest" continua apontando para o app do Windows
+          gh release create "android-v$VER" * --repo "$GITHUB_REPOSITORY" --target main \
+            --title "MultiHunt Android $VER" --notes-file ../NOTES.md --latest=false
+      - name: Avisar o site (atualização automática)
+        if: env.DRY == '0'
+        run: |
+          set -euo pipefail
+          VER=$(tr -d '[:space:]' < VERSION)
+          IFS=. read -r A B C <<< "$VER"
+          CODE=$((A * 10000 + B * 100 + C))
+          F="files/MultiHunt-$VER.apk"
+          jq -n --arg v "$VER" --argjson c "$CODE" --rawfile notes NOTES.md \
+            --arg u "https://github.com/$GITHUB_REPOSITORY/releases/download/android-v$VER/MultiHunt-$VER.apk" \
+            --arg s "$(sha256sum "$F" | cut -d' ' -f1)" --argjson z "$(stat -c%s "$F")" \
+            '{platform:"android", version:$v, versionCode:$c, notes:$notes, apkUrl:$u, apkSha256:$s, apkSize:$z}' > payload.json
+          curl -fsS -X POST "$SITE/api/webhooks/release" -H "authorization: Bearer ${HOOK_SECRET}" -H "content-type: application/json" --data @payload.json
+      - name: Limpar
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -f "$RUNNER_TEMP/release.p12"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/upload-android" || true
