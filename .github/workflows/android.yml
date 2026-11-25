@@ -87,7 +87,9 @@ jobs:
         run: |
           set -euo pipefail
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          "$BT/apksigner" verify --print-certs files/*.apk | grep -E "Signer #1 certificate (DN|SHA-256)"
+          OUT=$("$BT/apksigner" verify --print-certs files/*.apk)
+          echo "$OUT" | grep -E "certificate (DN|SHA-256)" || true
+          echo "$OUT" | grep -q "CN=MultiHunt" || { echo "APK não está assinado com a chave do MultiHunt"; exit 1; }
       - name: Criar release
         if: env.DRY == '0'
         env:
